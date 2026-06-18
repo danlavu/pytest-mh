@@ -8,16 +8,17 @@ from functools import partial, wraps
 from os import _exit
 from pathlib import Path
 from signal import SIGINT, signal
-from typing import Generator, Literal, Type, get_type_hints
+from typing import Callable, Generator, Literal, Type, get_type_hints
 
 import pytest
 import yaml
 
 from .artifacts import MultihostArtifactsCollectable, MultihostArtifactsType
 from .data import MultihostItemData
+from .errors import TeardownExceptionGroup
 from .fixtures import MultihostFixture
 from .logging import MultihostLogger
-from .marks import TopologyMark
+from .marks import KnownTopologyBase, TopologyMark
 from .multihost import (
     MultihostArtifactsMode,
     MultihostConfig,
@@ -50,6 +51,7 @@ class MultihostPlugin(object):
         self.current_mh: MultihostFixture | None = None
         self.current_topology: str | None = None
         self.required_hosts: list[MultihostHost] = []
+        self.pytest_session: pytest.Session | None = None
 
         # CLI options
         self.mh_config: str = pytest_config.getoption("mh_config")
@@ -61,6 +63,7 @@ class MultihostPlugin(object):
         self.mh_collect_artifacts: MultihostArtifactsMode = pytest_config.getoption("mh_collect_artifacts")
         self.mh_artifacts_dir: Path = Path(pytest_config.getoption("mh_artifacts_dir"))
         self.mh_compress_artifacts: bool = pytest_config.getoption("mh_compress_artifacts")
+        self.mh_ignore_preferred_topology: bool = pytest_config.getoption("mh_ignore_preferred_topology")
 
         # Read --mh-collect-logs, default to --mh-collect-artifacts
         self.mh_collect_logs: MultihostArtifactsMode = pytest_config.getoption("mh_collect_logs")
@@ -168,6 +171,8 @@ class MultihostPlugin(object):
 
         :meta private:
         """
+        self.pytest_session = session
+
         # Calling the setup here instead of in constructor to allow running
         # pytest --help and other action-less parameters.
         self.setup()
@@ -196,6 +201,7 @@ class MultihostPlugin(object):
         self.logger.info(f"  collect artifacts: {self.mh_collect_artifacts}")
         self.logger.info(f"  artifacts directory: {self.mh_artifacts_dir}")
         self.logger.info(f"  collect logs: {self.mh_collect_logs}")
+        self.logger.info(f"  ignore-preferred-topology: {self.mh_ignore_preferred_topology}")
         self.logger.info("")
 
         signal(SIGINT, self.sigint_handler)
@@ -330,6 +336,12 @@ class MultihostPlugin(object):
 
         # Run pytest_setup on all hosts required by selected tests
         if not self.pytest_opt_collect_only:
+            # Connect to all required hosts to fail quickly if some connection
+            # cannot be established.
+            if self.multihost is not None and not self.multihost.lazy_ssh:
+                for host in self.required_hosts:
+                    host.conn.connect()
+
             self._setup_hosts(self.required_hosts)
 
     @pytest.hookimpl(tryfirst=True)
@@ -435,8 +447,16 @@ class MultihostPlugin(object):
         if self.current_mh is None:
             return None
 
+        # Store current outcome in case it is changed by the hook
+        original_outcome = report.outcome
+
         status = self.current_mh._pytest_report_teststatus(report, config)
         setattr(report, "_pytest_mh__teststatus", status)
+
+        # If the outcome is changed and failed, count it towards failures.
+        if original_outcome != report.outcome and report.failed:
+            if self.pytest_session is not None:
+                self.pytest_session.testsfailed += 1
 
         return status
 
@@ -503,6 +523,32 @@ class MultihostPlugin(object):
     def _is_multihost_required(self, item: pytest.Item) -> bool:
         return item.get_closest_marker(name="topology") is not None
 
+    def _can_run_preferred_topology(self, mark: pytest.Mark, current_topology: str, item: pytest.Item) -> bool:
+        if len(mark.args) != 1:
+            raise ValueError(
+                f"{item.nodeid}: Unexpected number of arguments to pytest.mark.preferred_topology: "
+                f"got {len(mark.args)}, expected 1"
+            )
+
+        arg = mark.args[0]
+
+        if isinstance(arg, KnownTopologyBase):
+            name = arg.value.name
+        elif isinstance(arg, TopologyMark):
+            name = arg.name
+        elif isinstance(arg, str):
+            name = arg
+        else:
+            raise ValueError(
+                f"{item.nodeid}: Unexpected type of pytest.mark.preferred_topology: "
+                f"got {type(arg)}, expected KnownTopologyBase | TopologyMark | str"
+            )
+
+        if name == current_topology:
+            return True
+
+        return False
+
     def _can_run_test(self, item: pytest.Item, data: MultihostItemData | None) -> bool:
         if data is None:
             return not self._is_multihost_required(item)
@@ -528,6 +574,12 @@ class MultihostPlugin(object):
 
             if data.topology_mark.name not in self.mh_topology:
                 return False
+
+        # Run only for preferred topology unless specific topology is requested or the marker is ignored
+        if not self.mh_topology and not self.mh_ignore_preferred_topology:
+            preferred_topology = item.get_closest_marker(name="preferred_topology")
+            if preferred_topology is not None and data.topology_mark is not None:
+                return self._can_run_preferred_topology(preferred_topology, data.topology_mark.name, item)
 
         return True
 
@@ -649,7 +701,7 @@ class MultihostPlugin(object):
                 self.multihost.logger.flush(outcome, f"hosts/{host.hostname}/pytest_teardown.log")
 
         if errors:
-            raise Exception(errors)
+            raise TeardownExceptionGroup("Unable to teardown some hosts (host.pytest_teardown)", errors)
 
     def _setup_topology(self, name: str, controller: TopologyController) -> None:
         # Silent mypy false positive
@@ -713,7 +765,9 @@ class MultihostPlugin(object):
             controller.logger.phase(f"TOPOLOGY TEARDOWN EXIT HOST UTILS DONE :: {name}")
 
             if errors:
-                raise Exception(errors)
+                raise TeardownExceptionGroup(
+                    "Unable to teardown topology (topology_controller.topology_teardown)", errors
+                )
 
             outcome = "passed"
         finally:
@@ -771,6 +825,12 @@ def pytest_addoption(parser):
     parser.addoption("--mh-log-path", action="store", help="Path to store multihost logs")
 
     parser.addoption("--mh-lazy-ssh", action="store_true", help="Postpone connecting to host SSH until it is required")
+
+    parser.addoption(
+        "--mh-ignore-preferred-topology",
+        action="store_true",
+        help="All topologies will run, ignore the preferred_topology marker",
+    )
 
     parser.addoption(
         "--mh-topology",
@@ -842,10 +902,17 @@ def pytest_configure(config: pytest.Config):
         "the test is skipped if condition is not met",
     )
 
+    config.addinivalue_line(
+        "markers",
+        "preferred_topology(topology: KnownTopologyBase | TopologyMark | str): "
+        "mark test with a preferred topology."
+        "Test will execute once, skipping additional topologies",
+    )
+
     config.pluginmanager.register(MultihostPlugin(config), "MultihostPlugin")
 
 
-def mh_fixture(scope: Literal["function"] = "function"):
+def mh_fixture(fixture_function: Callable | None = None, *, scope: Literal["function"] = "function"):
     """
     This creates a function-scoped pytest fixture that can access MultihostRole
     objects that are available to the test directly.
@@ -879,8 +946,7 @@ def mh_fixture(scope: Literal["function"] = "function"):
                 mh_args.append(arg)
                 continue
 
-        @wraps(fn)
-        def wrapper(mh: MultihostFixture, *args, **kwargs):
+        def call_fixture(mh: MultihostFixture, *args, **kwargs):
             if "mh" in full_sig.parameters:
                 kwargs["mh"] = mh
 
@@ -891,6 +957,24 @@ def mh_fixture(scope: Literal["function"] = "function"):
                 kwargs[arg] = mh.fixtures[arg]
 
             return fn(*args, **kwargs)
+
+        @wraps(fn)
+        def wrapper_normal(mh: MultihostFixture, *args, **kwargs):
+            return call_fixture(mh, *args, **kwargs)
+
+        @wraps(fn)
+        def wrapper_yield(mh: MultihostFixture, *args, **kwargs):
+            gen = call_fixture(mh, *args, **kwargs)
+            yield next(gen)
+            try:
+                yield next(gen)
+            except StopIteration:
+                pass
+
+        # Select wrapper
+        wrapper = wrapper_normal
+        if inspect.isgeneratorfunction(fn):
+            wrapper = wrapper_yield
 
         # Bound multihost parameters
         cb = wraps(fn)(partial(wrapper, **{arg: None for arg in mh_args}))
@@ -903,10 +987,28 @@ def mh_fixture(scope: Literal["function"] = "function"):
         partial_parameters.extend(
             [param for key, param in full_sig.parameters.items() if key != "mh" and key not in mh_args]
         )
-        fixture.__pytest_wrapped__.obj.func.__signature__ = inspect.Signature(
-            partial_parameters, return_annotation=full_sig.return_annotation
-        )
+
+        # pytest < 8.4.0 provides its own wrapper around the function and checks
+        # signature of the real function, not the partial one, so we need to mock
+        # signatures of the decorated function (fn)
+        if hasattr(fixture, "__pytest_wrapped__"):
+            func = fixture.__pytest_wrapped__.obj.func
+        # pytest >= 8.4.0 does not unwrap it anymore and reads signature of the
+        # provided function, i.e. the partial one (cb)
+        elif hasattr(fixture, "__wrapped__"):
+            func = fixture._get_wrapped_function()
+        else:
+            raise AttributeError(
+                "Fixture object has no __pytest_wrapped__ nor __wrapped__ attribute, "
+                "report this to pytest-mh upstream."
+            )
+
+        func.__signature__ = inspect.Signature(partial_parameters, return_annotation=full_sig.return_annotation)
 
         return fixture
+
+    # Direct decoration.
+    if fixture_function:
+        return decorator(fixture_function)
 
     return decorator

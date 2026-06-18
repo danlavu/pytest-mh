@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Mapping, Tuple
+from typing import TYPE_CHECKING, Any, Mapping, Self, Tuple
 
 import pytest
 
@@ -28,7 +28,7 @@ class TopologyMark(object):
         @pytest.mark.topology(
             name, topology,
             controller=controller,
-            fixture=dict(fixture1='path1', fixture2='path2', ...)
+            fixtures=dict(fixture1='path1', fixture2='path2', ...)
         )
         def test_fixture_name(fixture1: BaseRole, fixture2: BaseRole, ...):
             assert True
@@ -149,31 +149,50 @@ class TopologyMark(object):
 
     @classmethod
     def ExpandMarkers(cls, item: pytest.Item) -> list[pytest.Mark]:
+        def _process_list(topology_list: list):
+            out = []
+            for topology in topology_list:
+                if not isinstance(topology, (TopologyMark, KnownTopologyBase)):
+                    raise TypeError(f"Expected TopologyMark or KnownTopologyBase, got {type(topology)}")
+
+                out.append(pytest.mark.topology(topology))
+
+            return out
+
         out = []
         for mark in item.iter_markers("topology"):
-            # We need to use generic classes in order to avoid circular import
+            # Add KnownTopologyGroupBase which values contains list[TopologyMark | KnownTopologyBase]
             if isinstance(mark.args[0], KnownTopologyGroupBase) and isinstance(mark.args[0].value, list):
-                for topology in mark.args[0].value:
-                    out.append(pytest.mark.topology(topology))
+                out.extend(_process_list(mark.args[0].value))
                 continue
 
+            # Add list[TopologyMark | KnownTopologyBase]
+            if isinstance(mark.args[0], list):
+                out.extend(_process_list(mark.args[0]))
+                continue
+
+            # Other markers will be created from arguments using TopologyMark.Create
             out.append(mark)
 
         return out
 
     @classmethod
-    def Create(cls, item: pytest.Function, mark: pytest.Mark) -> TopologyMark:
+    def Create(cls, item: pytest.Function, mark: pytest.Mark) -> Self:
         """
         Create instance of :class:`TopologyMark` from ``@pytest.mark.topology``.
 
         :raises ValueError:
-        :rtype: TopologyMark
+        :rtype: Self
         """
         nodeid = item.parent.nodeid if item.parent is not None else ""
         error = f"{nodeid}::{item.originalname}: invalid arguments for @pytest.mark.topology"
 
         if not mark.args or len(mark.args) > 3:
             raise ValueError(error)
+
+        # Constructor for TopologyMark
+        if isinstance(mark.args[0], cls):
+            return mark.args[0]
 
         # Constructor for KnownTopologyBase
         if isinstance(mark.args[0], KnownTopologyBase):
@@ -186,12 +205,12 @@ class TopologyMark(object):
             return mark.args[0].value
 
         # Generic constructor.
-        return cls._CreateFromArgs(item, mark.args, mark.kwargs)
+        return cls.CreateFromArgs(item, mark.args, mark.kwargs)
 
     @classmethod
-    def _CreateFromArgs(cls, item: pytest.Function, args: Tuple, kwargs: Mapping[str, Any]) -> TopologyMark:
+    def CreateFromArgs(cls, item: pytest.Function, args: Tuple, kwargs: Mapping[str, Any]) -> Self:
         """
-        Create :class:`TopologyMark` from pytest marker arguments.
+        Create :class:`TopologyMark` from pytest.mark.topology arguments.
 
         .. warning::
 
@@ -207,7 +226,7 @@ class TopologyMark(object):
         :type kwargs: Mapping[str, Any]
         :raises ValueError: If the marker is invalid.
         :return: Instance of TopologyMark.
-        :rtype: TopologyMark
+        :rtype: Self
         """
         # First two parameters are positional, the rest are keyword arguments.
         if len(args) != 2:
@@ -275,19 +294,26 @@ class KnownTopologyGroupBase(Enum):
 
         @final
         @unique
+        class KnownTopology(KnownTopologyBase):
+            A = TopologyMark(
+                name='A',
+                topology=Topology(TopologyDomain('test', a=1)),
+                fixtures=dict(a='test.a[0]'),
+            )
+
+            B = TopologyMark(
+                name='B',
+                topology=Topology(TopologyDomain('test', b=1)),
+                fixtures=dict(b='test.b[0]'),
+            )
+
+
+        @final
+        @unique
         class KnownTopologyGroup(KnownTopologyGroupBase):
             All = [
-                TopologyMark(
-                    name='A',
-                    topology=Topology(TopologyDomain('test', a=1)),
-                    fixtures=dict(a='test.a[0]', generic='test.a[0]'),
-                ),
-
-                B = TopologyMark(
-                    name='B',
-                    topology=Topology(TopologyDomain('test', b=1)),
-                    fixtures=dict(b='test.b[0]', generic='test.a[0]'),
-                )
+                KnownTopology.A,
+                KnownTopology.B,
             ]
 
 

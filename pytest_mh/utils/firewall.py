@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from random import randrange
 from typing import Any, Literal, TypeAlias
 
 from .. import MultihostHost, MultihostRole, MultihostUtility
-from ..ssh import SSHLog
+from ..conn import ProcessLogLevel
 
-__all__ = ["Firewalld"]
+__all__ = ["Firewall", "Firewalld", "WindowsFirewall"]
 
 
 HostSpec: TypeAlias = str | MultihostHost | MultihostRole
@@ -21,7 +23,7 @@ PortSpec: TypeAlias = int | tuple[int, ProtocolSpec]
 """Firewall port specification."""
 
 
-class Firewall(MultihostUtility):
+class Firewall(MultihostUtility[MultihostHost]):
     """
     Configure host firewall.
 
@@ -232,6 +234,7 @@ class Firewalld(Firewall):
 
         self.__inbound: FirewalldInboundRules = FirewalldInboundRules(self)
         self.__outbound: FirewalldOutboundRules = FirewalldOutboundRules(self)
+        self._policies: list[str] = []
 
         self._priority: int = 30000
         """
@@ -244,13 +247,25 @@ class Firewalld(Firewall):
         not remove "accept" rule but the "drop" rule takes precedence.
         """
 
+    def setup(self) -> None:
+        """
+        Set the firewall up.
+
+        :meta private:
+        """
+        super().setup()
+        self.add_policy(f"test-policy-{randrange(99999)}", ingress="HOST", egress="ANY")
+        self.host.conn.exec(["firewall-cmd", "--reload"], log_level=ProcessLogLevel.Error)
+
     def teardown(self) -> None:
         """
         Revert all firewall changes.
 
         :meta private:
         """
-        self.host.ssh.exec(["firewall-cmd", "--reload"])
+        for policy in list(self._policies):
+            self.remove_policy(policy)
+        self.host.conn.exec(["firewall-cmd", "--reload"])
         super().teardown()
 
     @property
@@ -289,95 +304,99 @@ class Firewalld(Firewall):
         self._priority -= 1
         return priority
 
-    def add_direct_rule(
+    @property
+    def _default_policy(self) -> str:
+        """
+        Returns the name of the default policy.
+
+        The default policy is the first one to be added.
+        This is usually the one created at ``setup()``.
+
+        If no policy was created (quite strange situation), an exception is raised.
+        """
+        return self._policies[0]
+
+    def add_policy(
         self,
-        chain: str,
-        args: list[Any],
+        name: str,
         *,
-        table: str = "filter",
-        ip_family: Literal["ipv4", "ipv6", "all"] = "all",
+        ingress: str | None = None,
+        egress: str | None = None,
         priority: int | None = None,
+        target: Literal["CONTINUE", "ACCEPT", "DROP", "REJECT"] | None = None,
     ) -> int:
         """
-        Add a new direct rule.
+        Add a new (permanent) policy.
 
-        This methods returns a priority of this rule. You need to use this
-        priority if you remove the rule with :meth:`remove_direct_rule`.
+        Except for the name, all parameters are optional. When the priority is not provided,
+        the next priority is assigned. When the other parameters are not provided,
+        no value is assigned to the newly created policy and it defaults to ``firewalld``'s
+        defaults.
 
-        :param chain: iptables chain (e.g. INPUT or OUTPUT).
-        :type chain: str
-        :param args: iptables arguments
-        :type args: list[Any]
-        :param table: iptables table, defaults to "filter"
-        :type table: str, optional
-        :param ip_family: If the rules is added as IPv4, IPv6 rule or both, defaults to ``all``.
-        :type ip_family: Literal["ipv4", "ipv6", "all"], optional
-        :param priority: Rule priority, defaults to None (= auto-assign next value)
-        :type priority: int | None, optional
-        :return: Rule priority, to be used for rule removal.
+        :param name: The policy name
+        :type name: str
+        :param ingress: The ingress zone, not assigned if not provided.
+        :type ingress: str | None, optional.
+        :param egress: The egress zone, not assigned if not provided.
+        :type egress: str | None, optional.
+        :param priority: Rule priority, defaults to the next priority.
+        :type priority: int | None, optional.
+        :param target: Rule target, not assigned if not provided.
+        :type target: Literal["CONTINUE", "ACCEPT", "DROP", "REJECT"] | None, optional.
+        :return: Policy priority.
         :rtype: int
         """
+        self.logger.info(f'Firewalld: adding policy "{name}"')
+
+        cmd = ["firewall-cmd", "--permanent", "--new-policy", name]
+        self.host.conn.exec(cmd, log_level=ProcessLogLevel.Error)
+        self._policies.append(name)
+        cmd[2] = "--policy"
+
         if priority is None:
             priority = self._next_priority
+        self.host.conn.exec([*cmd, "--set-priority", str(priority)], log_level=ProcessLogLevel.Error)
 
-        cmd = [table, chain, priority, *args]
+        if ingress is not None:
+            self.host.conn.exec([*cmd, "--add-ingress-zone", ingress], log_level=ProcessLogLevel.Error)
 
-        if ip_family in ["ipv4", "all"]:
-            self.logger.info(f'Firewalld: adding IPv4 direct firewall rule: {" ".join([str(x) for x in cmd])}')
-            self.host.ssh.exec(["firewall-cmd", "--direct", "--add-rule", "ipv4", *cmd], log_level=SSHLog.Error)
+        if egress is not None:
+            self.host.conn.exec([*cmd, "--add-egress-zone", egress], log_level=ProcessLogLevel.Error)
 
-        if ip_family in ["ipv6", "all"]:
-            self.logger.info(f'Firewalld: adding IPv6 direct firewall rule: {" ".join([str(x) for x in cmd])}')
-            self.host.ssh.exec(["firewall-cmd", "--direct", "--add-rule", "ipv6", *cmd], log_level=SSHLog.Error)
+        if target is not None:
+            self.host.conn.exec([*cmd, "--set-target", target], log_level=ProcessLogLevel.Error)
 
         return priority
 
-    def remove_direct_rule(
-        self,
-        priority: int,
-        chain: str,
-        args: list[Any],
-        *,
-        table: str = "filter",
-        ip_family: Literal["ipv4", "ipv6", "all"],
-    ) -> None:
+    def remove_policy(self, name: str) -> None:
         """
-        Remove direct rule.
+        Remove a (permanent) policy.
 
-        :param priority: Rule priority.
-        :type priority: int
-        :param chain: iptables chain (e.g. INPUT or OUTPUT).
-        :type chain: str
-        :param args: iptables arguments
-        :type args: list[Any]
-        :param table: iptables table, defaults to "filter"
-        :type table: str, optional
-        :param ip_family: If the rules is removed from IPv4, IPv6 rules or both, defaults to ``all``.
-        :type ip_family: Literal["ipv4", "ipv6", "all"], optional
+        :param name: The name of the policy to be removed.
+        :type name: str
         """
-        cmd = [table, chain, priority, *args]
+        self.logger.info(f'Firewalld: removing policy "{name}"')
+        self.host.conn.exec(["firewall-cmd", "--permanent", "--delete-policy", name], log_level=ProcessLogLevel.Error)
+        self._policies.remove(name)
 
-        if ip_family in ["ipv4", "all"]:
-            self.logger.info(f'Firewalld: removing IPv4 direct firewall rule: {" ".join([str(x) for x in cmd])}')
-            self.host.ssh.exec(["firewall-cmd", "--direct", "--remove-rule", "ipv4", *cmd], log_level=SSHLog.Error)
-
-        if ip_family in ["ipv6", "all"]:
-            self.logger.info(f'Firewalld: removing IPv6 direct firewall rule: {" ".join([str(x) for x in cmd])}')
-            self.host.ssh.exec(["firewall-cmd", "--direct", "--remove-rule", "ipv6", *cmd], log_level=SSHLog.Error)
-
-    def add_rich_rule(self, rule: str, priority: int | None = None) -> int:
+    def add_rich_rule(self, rule: str, policy: str | None = None, priority: int | None = None) -> int:
         """
         Add rich rule.
+
+        When the policy is specified, the rule will be added to that policy,
+        or to the default policy when not specified.
 
         The parameter "rule" is the part after "rule priority=X". This part is
         added automatically. That is:
 
         .. code-block:: console
 
-            $ firewall-cmd --add-rich-rule rule priority={priority} {rule}
+            $ firewall-cmd [--policy {policy}] --add-rich-rule rule priority={priority} {rule}
 
         :param rule: Firewalld rich rule.
         :type rule: str
+        :param policy: The policy to use.
+        :type policy: str | None, optional
         :param priority: Rule priority, defaults to None (= auto-assign next
             value)
         :type priority: int | None, optional
@@ -387,13 +406,18 @@ class Firewalld(Firewall):
         if priority is None:
             priority = self._next_priority
 
+        if policy is None:
+            policy = self._default_policy
+
         rule = f"rule priority={priority} {rule}"
         self.logger.info(f'Firewalld: adding rich rule "{rule}"')
-        self.host.ssh.exec(["firewall-cmd", "--add-rich-rule", rule], log_level=SSHLog.Error)
+        self.host.conn.exec(
+            ["firewall-cmd", "--policy", policy, "--add-rich-rule", rule], log_level=ProcessLogLevel.Error
+        )
 
         return priority
 
-    def remove_rich_rule(self, priority: int, rule: str) -> None:
+    def remove_rich_rule(self, priority: int, rule: str, policy: str | None = None) -> None:
         """
         Remove rich rule.
 
@@ -404,14 +428,24 @@ class Firewalld(Firewall):
 
             $ firewall-cmd --remove-rich-rule rule priority="{priority}" {rule}
 
+        When the policy is specified, the rule will be removev from that policy,
+        or from the default policy when not specified.
+
         :param priority: Rule priority
         :type priority: int
         :param rule: Firewalld rich rule.
         :type rule: str
+        :param policy: The policy to use.
+        :type policy: str | None, optional
         """
+        if policy is None:
+            policy = self._default_policy
+
         rule = f"rule priority={priority} {rule}"
         self.logger.info(f'Firewalld: removing rich rule  "{rule}"')
-        self.host.ssh.exec(["firewall-cmd", "--remove-rich-rule", rule], log_level=SSHLog.Error)
+        self.host.conn.exec(
+            ["firewall-cmd", "--policy", policy, "--remove-rich-rule", rule], log_level=ProcessLogLevel.Error
+        )
 
 
 class FirewalldInboundRules(FirewallInboundRules):
@@ -492,16 +526,16 @@ class FirewalldOutboundRules(FirewallOutboundRules):
         self.firewall: Firewalld = firewall
 
     def accept_port(self, port: PortSpec | list[PortSpec]) -> None:
-        self.__add_port(port, action="ACCEPT")
+        self.__add_port(port, action="accept")
 
     def reject_port(self, port: PortSpec | list[PortSpec]) -> None:
-        self.__add_port(port, action="REJECT")
+        self.__add_port(port, action="reject")
 
     def drop_port(self, port: PortSpec | list[PortSpec]) -> None:
-        self.__add_port(port, action="DROP")
+        self.__add_port(port, action="drop")
 
     def accept_host(self, host: HostSpec | list[HostSpec]) -> None:
-        self.__add_host(host, action="ACCEPT")
+        self.__add_host(host, action="accept")
 
     def reject_host(self, host: HostSpec | list[HostSpec]) -> None:
         """
@@ -522,16 +556,16 @@ class FirewalldOutboundRules(FirewallOutboundRules):
         :param host: Hostname, MultihostHost or MultihostRole object.
         :type host: HostSpec | list[HostSpec]
         """
-        self.__add_host(host, action="REJECT")
+        self.__add_host(host, action="reject")
 
     def drop_host(self, host: HostSpec | list[HostSpec]) -> None:
-        self.__add_host(host, action="DROP")
+        self.__add_host(host, action="drop")
 
     def __add_port(
         self,
         port: PortSpec | list[PortSpec],
         *,
-        action: Literal["ACCEPT", "REJECT", "DROP"],
+        action: Literal["accept", "reject", "drop"],
     ) -> None:
         items = port if isinstance(port, list) else [port]
         for item in items:
@@ -541,15 +575,13 @@ class FirewalldOutboundRules(FirewallOutboundRules):
             else:
                 port, protocol = self.firewall.parse_port_spec(item)
 
-            self.firewall.add_direct_rule(
-                chain="OUTPUT", args=["-p", protocol, "--dport", port, "-j", action], table="filter"
-            )
+            self.firewall.add_rich_rule(f"port port={port} protocol={protocol} {action}")
 
     def __add_host(
         self,
         host: HostSpec | list[HostSpec],
         *,
-        action: Literal["ACCEPT", "REJECT", "DROP"],
+        action: Literal["accept", "reject", "drop"],
     ) -> None:
         items = host if isinstance(host, list) else [host]
         for item in items:
@@ -568,19 +600,25 @@ class FirewalldOutboundRules(FirewallOutboundRules):
             )
 
             for ip in ipv4s:
-                self.firewall.add_direct_rule(
-                    chain="OUTPUT", args=["--destination", ip, "-j", action], table="filter", ip_family="ipv4"
-                )
+                self.firewall.add_rich_rule(f"family=ipv4 destination address={ip} {action}")
 
             for ip in ipv6s:
-                self.firewall.add_direct_rule(
-                    chain="OUTPUT", args=["--destination", ip, "-j", action], table="filter", ip_family="ipv6"
-                )
+                self.firewall.add_rich_rule(f"family=ipv6 destination address={ip} {action}")
 
     def __resolve_hostname(self, hostname: str, type: Literal["A", "AAAA"]) -> list[str]:
-        result = self.firewall.host.ssh.exec(["dig", "+short", "-t", type, hostname], log_level=SSHLog.Error)
+        addrs = []
+        try:
+            ip = ip_address(hostname)
+            ip_type = IPv4Address if type == "A" else IPv6Address
+            if isinstance(ip, ip_type):
+                addrs = [hostname]
+        except ValueError:
+            result = self.firewall.host.conn.exec(
+                ["dig", "+short", "-t", type, hostname], log_level=ProcessLogLevel.Error
+            )
+            addrs = result.stdout_lines
 
-        return result.stdout_lines
+        return addrs
 
 
 class WindowsFirewall(Firewall):
@@ -617,8 +655,8 @@ class WindowsFirewall(Firewall):
         """
         super().setup()
         self.logger.info(f"Windows Firewall: creating backup at '{self._backup}'")
-        self.host.ssh.run(
-            f"Remove-Item {self._backup}; netsh advfirewall export {self._backup}", log_level=SSHLog.Error
+        self.host.conn.run(
+            f"Remove-Item {self._backup}; netsh advfirewall export {self._backup}", log_level=ProcessLogLevel.Error
         )
 
     def teardown(self):
@@ -628,7 +666,9 @@ class WindowsFirewall(Firewall):
         :meta private:
         """
         self.logger.info(f"Windows Firewall: restoring from '{self._backup}'")
-        self.host.ssh.run(f"netsh advfirewall reset; netsh advfirewall import {self._backup}", log_level=SSHLog.Error)
+        self.host.conn.run(
+            f"netsh advfirewall reset; netsh advfirewall import {self._backup}", log_level=ProcessLogLevel.Error
+        )
         super().teardown()
 
     @property
@@ -690,7 +730,7 @@ class WindowsFirewall(Firewall):
             self.remove_rule(opposite)
 
         self.logger.info(f'Windows Firewall: adding rule: {" ".join([str(x) for x in cmd])}')
-        self.host.ssh.exec(cmd, log_level=SSHLog.Error)
+        self.host.conn.exec(cmd, log_level=ProcessLogLevel.Error)
         self._rules.append(fullname)
 
         return fullname
@@ -704,7 +744,7 @@ class WindowsFirewall(Firewall):
         """
         cmd = ["Remove-NetFirewallRule", "-DisplayName", name]
         self.logger.info(f'Windows Firewall: removing rule: {" ".join([str(x) for x in cmd])}')
-        self.host.ssh.exec(cmd, log_level=SSHLog.Error)
+        self.host.conn.exec(cmd, log_level=ProcessLogLevel.Error)
         self._rules.remove(name)
 
 
@@ -810,7 +850,7 @@ class WindowsFirewallOutboundRules(FirewallOutboundRules):
             self.firewall.add_rule(f"{hostname}", "outbound", action, ["-RemoteAddress", ",".join([*ipv4s, *ipv6s])])
 
     def __resolve_hostname(self, hostname: str, type: Literal["A", "AAAA"]) -> list[str]:
-        result = self.firewall.host.ssh.run(
-            f"(Resolve-DnsName -Type {type} -Name {hostname}).IpAddress", log_level=SSHLog.Error
+        result = self.firewall.host.conn.run(
+            f"(Resolve-DnsName -Type {type} -Name {hostname}).IpAddress", log_level=ProcessLogLevel.Error
         )
         return result.stdout_lines

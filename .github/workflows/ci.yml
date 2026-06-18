@@ -19,12 +19,15 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v3
-    - uses: actions/setup-python@v4
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        sudo apt-get update
+        sudo apt-get install -y libssh-dev
+
         python -m pip install --upgrade pip
         pip install tox tox-gh
     - name: Prepare tox environment and install packages
@@ -39,18 +42,35 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/setup-python@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: 3.11
 
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
-    - name: Setup containers
-      uses: SSSD/sssd-ci-containers/actions/setup@master
-      with:
-        path: sssd-ci-containers
-        limit: dns client kdc
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -ex
+        sudo apt-get update
+        sudo apt-get install -y podman docker-compose
+
+    - name: Start podman socket
+      shell: bash
+      run: |
+        sudo systemctl enable podman.socket
+        sudo systemctl restart podman.socket
+
+    - name: Build containers
+      working-directory: example/containers
+      run: |
+        sudo docker-compose -H unix:///run/podman/podman.sock build
+
+    - name: Start containers
+      working-directory: example/containers
+      run: |
+        sudo docker-compose -H unix:///run/podman/podman.sock up --detach
 
     - name: Install packages
       run: |
@@ -60,9 +80,11 @@ jobs:
         pip3 install virtualenv
         python3 -m venv .venv
         source .venv/bin/activate
+        pip3 install -e .
         pip3 install -r ./requirements.txt
+        pip3 install -r ./example/requirements.txt
 
     - name: Run example tests
       run: |
         source .venv/bin/activate
-        pytest --color=yes --mh-config=./example/mhc.yaml -vv ./example
+        pytest --color=yes --mh-config=./example/mhc.yaml -vvv ./example

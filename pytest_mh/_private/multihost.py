@@ -4,24 +4,36 @@ from abc import ABC, ABCMeta, abstractmethod
 from collections import deque
 from contextlib import contextmanager
 from functools import wraps
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generator, Generic, Self, Type, TypeVar
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, Generator, Generic, Self, Sequence, Type, TypeVar
 
 import pytest
 
 from ..cli import CLIBuilder
-from ..ssh import SSHBashProcess, SSHClient, SSHPowerShellProcess, SSHProcess
+from ..conn import (
+    Bash,
+    Connection,
+    Powershell,
+    Process,
+    ProcessError,
+    ProcessInputBuffer,
+    ProcessResult,
+    ProcessTimeoutError,
+    Shell,
+)
+from ..conn.container import ContainerClient
+from ..conn.ssh import SSHClient
 from .artifacts import (
     MultihostArtifactsCollector,
     MultihostArtifactsMode,
     MultihostArtifactsType,
     MultihostHostArtifacts,
 )
+from .errors import TeardownExceptionGroup
 from .logging import MultihostHostLogger, MultihostLogger
-from .misc import OperationStatus
+from .misc import OperationStatus, validate_configuration
 from .topology import Topology
 from .types import MultihostOSFamily
-from .utils import validate_configuration
 
 if TYPE_CHECKING:
     from .fixtures import MultihostFixture
@@ -173,6 +185,9 @@ class MultihostConfig(ABC):
         self.confdict: dict[str, Any] = confdict
         """Multihost configuration dictionary given to the constructor."""
 
+        self.config: dict[str, Any] = confdict.get("config", {})
+        """Custom configuration."""
+
         self.logger: MultihostLogger = logger
         """Multihost logger"""
 
@@ -298,6 +313,9 @@ class MultihostDomain(ABC, Generic[ConfigType]):
 
         self.confdict: dict[str, Any] = confdict
         """Multihost domain configuration dictionary given to the constructor."""
+
+        self.config: dict[str, Any] = confdict.get("config", {})
+        """Custom configuration."""
 
         self.mh_config: ConfigType = config
         """Multihost configuration"""
@@ -461,8 +479,6 @@ class MultihostHost(Generic[DomainType], metaclass=_MultihostHostMeta):
         :type domain: DomainType
         :param confdict: Host configuration as a dictionary.
         :type confdict: dict[str, Any]
-        :param shell: Shell used in SSH connection, defaults to '/usr/bin/bash -c'.
-        :type shell: str
         """
         self._op_state: OperationStatus = OperationStatus()
         """Keep state of setup and teardown methods."""
@@ -496,25 +512,6 @@ class MultihostHost(Generic[DomainType], metaclass=_MultihostHostMeta):
         self.configured_artifacts: MultihostHostArtifacts = MultihostHostArtifacts(confdict.get("artifacts", []))
         """Host artifacts produced during tests, configured by the user."""
 
-        # SSH
-        ssh = confdict.get("ssh", {})
-
-        self.ssh_host: str = ssh.get("host", self.hostname)
-        """SSH host (resolvable hostname or IP address), defaults to :attr:`hostname`."""
-
-        self.ssh_port: int = int(ssh.get("port", 22))
-        """SSH port, defaults to ``22``."""
-
-        self.ssh_username: str = ssh.get("username", "root")
-        """SSH username, defaults to ``root``."""
-
-        self.ssh_password: str = ssh.get("password", "Secret123")
-        """SSH password, defaults to ``Secret123``."""
-
-        # Not configurable
-        self.shell: Type[SSHProcess] = SSHBashProcess
-        """Shell used in SSH session."""
-
         # Get host operating system information
         os = confdict.get("os", {})
 
@@ -525,33 +522,28 @@ class MultihostHost(Generic[DomainType], metaclass=_MultihostHostMeta):
         except ValueError:
             raise ValueError(f'Value "{os_family}" is not supported in os_family field of host configuration')
 
+        # Not configurable, since we expect specific shells in our code
+        self.shell: Shell = Bash()
+        """Shell used to run commands over host connection."""
+
         # Set host shell based on the operating system
         match self.os_family:
             case MultihostOSFamily.Linux:
-                self.shell = SSHBashProcess
+                pass
             case MultihostOSFamily.Windows:
-                self.shell = SSHPowerShellProcess
+                self.shell = Powershell()
             case _:
                 raise ValueError(f"Unknown operating system os_family: {self.os_family}")
 
-        # SSH connection
-        self.ssh: SSHClient = SSHClient(
-            host=self.ssh_host,
-            user=self.ssh_username,
-            password=self.ssh_password,
-            port=self.ssh_port,
-            logger=self.logger,
-            shell=self.shell,
-        )
-        """SSH client."""
+        # Connection to the host
+        self.conn: Connection[
+            Process[ProcessResult, ProcessInputBuffer, ProcessTimeoutError], ProcessResult[ProcessError]
+        ] = self.get_connection()
+        """Connection to the host."""
 
         # CLI Builder instance
-        self.cli: CLIBuilder = CLIBuilder(self.ssh)
+        self.cli: CLIBuilder = CLIBuilder(self.shell)
         """Command line builder."""
-
-        # Connect to SSH unless lazy ssh is set
-        if not self.mh_domain.mh_config.lazy_ssh:
-            self.ssh.connect()
 
         self.artifacts: MultihostHostArtifacts = MultihostHostArtifacts()
         """
@@ -604,7 +596,7 @@ class MultihostHost(Generic[DomainType], metaclass=_MultihostHostMeta):
         """
         pass
 
-    def get_artifacts_list(self, host: MultihostHost, type: MultihostArtifactsType) -> set[str]:
+    def get_artifacts_list(self, host: MultihostHost, artifacts_type: MultihostArtifactsType) -> set[str]:
         """
         Return the list of artifacts to collect.
 
@@ -615,12 +607,192 @@ class MultihostHost(Generic[DomainType], metaclass=_MultihostHostMeta):
 
         :param host: Host where the artifacts are being collected.
         :type host: MultihostHost
-        :param type: Type of artifacts that are being collected.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Type of artifacts that are being collected.
+        :type artifacts_type: MultihostArtifactsType
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
-        return self.configured_artifacts.get(type) | self.artifacts.get(type)
+        return self.configured_artifacts.get(artifacts_type) | self.artifacts.get(artifacts_type)
+
+    def get_connection(self) -> Connection:
+        """
+        Get connection object to the host with given shell.
+
+        This creates a connection object using the information from the
+        multihost configuration. The caller should not make any assumptions
+        about the connection mechanism.
+
+        :return: Generic connection to the host.
+        :rtype: Connection
+        """
+        conn_confdict = self.confdict.get("conn", {})
+        conn_type = conn_confdict.setdefault("type", "ssh")
+
+        match conn_type:
+            case "ssh":
+                return SSHClient.from_confdict(self, conn_confdict)
+            case "podman" | "docker":
+                return ContainerClient.from_confdict(self, conn_confdict)
+            case _:
+                raise ValueError(f"Unknown connection type: {conn_type}!")
+
+
+class MultihostBackupHost(MultihostHost[DomainType], ABC):
+    """
+    Abstract class implementing automatic backup and restore for a host.
+
+    A backup of the host is created once when pytest starts and the host is
+    restored automatically (unless disabled) when a test run is finished.
+
+    If the backup data is stored as :class:`~pathlib.PurePath` or a sequence of
+    :class:`~pathlib.PurePath`, the file is automatically removed from the host
+    when all tests are finished. Otherwise no action is done -- it is possible
+    to overwrite :meth:`remove_backup` to clean up your data if needed.
+
+    It is required to implement :meth:`start`, :meth:`stop`, :meth:`backup` and
+    :meth:`restore`. The :meth:`start` method is called in :meth:`pytest_setup`
+    unless ``auto_start`` is set to False and the implementation of this method
+    may raise ``NotImplementedError`` which will be ignored.
+
+    By default, the host is reverted when each test run is finished. This may
+    not always be desirable and can be disabled via ``auto_restore`` parameter
+    of the constructor.
+    """
+
+    def __init__(self, *args, auto_start: bool = True, auto_restore: bool = True, **kwargs) -> None:
+        """
+        :param auto_start: Automatically start service before taking the first
+            backup.
+        :type auto_restore: bool, optional
+        :param auto_restore: If True, the host is automatically restored to the
+            backup state when a test is finished in :meth:`teardown`, defaults
+            to True
+        :type auto_restore: bool, optional
+        """
+        super().__init__(*args, **kwargs)
+
+        self.backup_data: PurePath | Sequence[PurePath] | Any | None = None
+        """Backup data of vanilla state of this host."""
+
+        self._backup_auto_start: bool = auto_start
+        """
+        If True, the host is automatically started prior taking the first
+        backup.
+        """
+
+        self._backup_auto_restore: bool = auto_restore
+        """
+        If True, the host is automatically restored to the backup state when a
+        test is finished in :meth:`teardown`.
+        """
+
+    def pytest_setup(self) -> None:
+        """
+        Start the services via :meth:`start` and take a backup by calling
+        :meth:`backup`.
+        """
+        # Make sure required services are running
+        if self._backup_auto_start:
+            try:
+                self.start()
+            except NotImplementedError:
+                pass
+
+        # Create backup of initial state
+        self.backup_data = self.backup()
+
+    def pytest_teardown(self) -> None:
+        """
+        Remove backup files from the host (calls :meth:`remove_backup`).
+        """
+        self.remove_backup(self.backup_data)
+
+    def teardown(self) -> None:
+        """
+        Restore the host from the backup by calling :meth:`restore`.
+        """
+        if self._backup_auto_restore:
+            self.restore(self.backup_data)
+
+        super().teardown()
+
+    def remove_backup(self, backup_data: PurePath | Sequence[PurePath] | Any | None) -> None:
+        """
+        Remove backup data from the host.
+
+        If backup_data is not :class:`~pathlib.PurePath` or a sequence of
+        :class:`~pathlib.PurePath`, this will not have any effect. Otherwise,
+        the paths are removed from the host.
+
+        :param backup_data: Backup data.
+        :type backup_data: PurePath | Sequence[PurePath] | Any | None
+        """
+        if backup_data is None:
+            return
+
+        if isinstance(backup_data, PurePath):
+            backup_data = [backup_data]
+
+        if isinstance(backup_data, Sequence):
+            only_paths = True
+            for item in backup_data:
+                if not isinstance(item, PurePath):
+                    only_paths = False
+                    break
+
+            if only_paths:
+                if isinstance(self.conn.shell, Powershell):
+                    for item in backup_data:
+                        path = str(item)
+                        self.conn.exec(["Remove-Item", "-Force", "-Recurse", path])
+                else:
+                    for item in backup_data:
+                        path = str(item)
+                        self.conn.exec(["rm", "-fr", path])
+
+    @abstractmethod
+    def start(self) -> None:
+        """
+        Start required services.
+
+        :raises NotImplementedError: If start operation is not supported.
+        """
+        pass
+
+    @abstractmethod
+    def stop(self) -> None:
+        """
+        Stop required services.
+
+        :raises NotImplementedError: If stop operation is not supported.
+        """
+        pass
+
+    @abstractmethod
+    def backup(self) -> PurePath | Sequence[PurePath] | Any | None:
+        """
+        Backup backend data.
+
+        Returns directory or file path where the backup is stored (as
+        :class:`~pathlib.PurePath` or sequence of :class:`~pathlib.PurePath`) or
+        any Python data relevant for the backup. This data is passed to
+        :meth:`restore` which will use this information to restore the host to
+        its original state.
+
+        :return: Backup data.
+        :rtype: PurePath | Sequence[PurePath] | Any | None
+        """
+        pass
+
+    @abstractmethod
+    def restore(self, backup_data: Any | None) -> None:
+        """
+        Restore data from the backup.
+
+        :param backup_data: Backup data.
+        :type backup_data: PurePath | Sequence[PurePath] | Any | None
+        """
+        pass
 
 
 HostType = TypeVar("HostType", bound=MultihostHost)
@@ -679,7 +851,7 @@ class MultihostRole(Generic[HostType], metaclass=_MultihostRoleMeta):
         """
         pass
 
-    def get_artifacts_list(self, host: MultihostHost, type: MultihostArtifactsType) -> set[str]:
+    def get_artifacts_list(self, host: MultihostHost, artifacts_type: MultihostArtifactsType) -> set[str]:
         """
         Return the list of artifacts to collect.
 
@@ -690,34 +862,12 @@ class MultihostRole(Generic[HostType], metaclass=_MultihostRoleMeta):
 
         :param host: Host where the artifacts are being collected.
         :type host: MultihostHost
-        :param type: Type of artifacts that are being collected.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Type of artifacts that are being collected.
+        :type artifacts_type: MultihostArtifactsType
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
         return self.artifacts
-
-    def ssh(self, user: str, password: str, *, shell=SSHBashProcess) -> SSHClient:
-        """
-        Open SSH connection to the host as given user.
-
-        :param user: Username.
-        :type user: str
-        :param password: User password.
-        :type password: str
-        :param shell: Shell that will run the commands, defaults to SSHBashProcess
-        :type shell: str, optional
-        :return: SSH client connection.
-        :rtype: SSHClient
-        """
-        return SSHClient(
-            self.host.ssh_host,
-            user=user,
-            password=password,
-            port=self.host.ssh_port,
-            shell=shell,
-            logger=self.logger,
-        )
 
 
 class MultihostUtility(Generic[HostType], metaclass=_MultihostUtilityMeta):
@@ -775,9 +925,6 @@ class MultihostUtility(Generic[HostType], metaclass=_MultihostUtilityMeta):
         self.logger: MultihostLogger = self.host.logger
         """Multihost logger."""
 
-        self.used: bool = False
-        """Indicate if this utility instance was already used or not within current test."""
-
         self.artifacts: set[str] = set()
         """
         List of artifacts that will be automatically collected at specific
@@ -797,7 +944,7 @@ class MultihostUtility(Generic[HostType], metaclass=_MultihostUtilityMeta):
         """
         pass
 
-    def get_artifacts_list(self, host: MultihostHost, type: MultihostArtifactsType) -> set[str]:
+    def get_artifacts_list(self, host: MultihostHost, artifacts_type: MultihostArtifactsType) -> set[str]:
         """
         Return the list of artifacts to collect.
 
@@ -808,8 +955,8 @@ class MultihostUtility(Generic[HostType], metaclass=_MultihostUtilityMeta):
 
         :param host: Host where the artifacts are being collected.
         :type host: MultihostHost
-        :param type: Type of artifacts that are being collected.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Type of artifacts that are being collected.
+        :type artifacts_type: MultihostArtifactsType
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
@@ -837,7 +984,8 @@ class MultihostUtility(Generic[HostType], metaclass=_MultihostUtilityMeta):
         self, report: pytest.CollectReport | pytest.TestReport, config: pytest.Config
     ) -> tuple[str, str, str | tuple[str, dict[str, bool]]] | None:
         """
-        See :func:`pytest.hookspec.pytest_report_teststatus` for more information.
+        See pytest built-in hook
+        :func:`~_pytest.hookspec.pytest_report_teststatus` for more information.
 
         .. warning::
 
@@ -869,8 +1017,10 @@ class MultihostReentrantUtility(MultihostUtility[HostType]):
     """
     Reentrant multihost utility.
 
-    It provides the enter and exit methods that can be called multiple times in
-    order to create nested states.
+    It provides the __enter__ and __exit__ abstract methods that can be called
+    multiple times in order to create nested states. The implementation of
+    __enter__ should save current state and __exit__ should restore hosts into
+    this state.
 
     The utility can be used as a context manager, leaving the context will
     restore the system to the state during the context enter.
@@ -1094,6 +1244,7 @@ def mh_utility_exit(util: MultihostUtility, where: str) -> None:
 
     enter_where, enter_result = util._mh_exit_stack.pop()
     if enter_where != where:
+        util._mh_exit_stack.append((enter_where, enter_result))
         raise IndexError(f"Calling exit from unexpected place {where}, expected {enter_where}")
 
     if not enter_result:
@@ -1184,7 +1335,7 @@ def mh_utility_teardown_dependencies(
                 errors.append(e)
 
     if errors:
-        raise Exception(errors)
+        raise TeardownExceptionGroup("Unable to teardown some utilities (util.teardown)", errors)
 
 
 def mh_utility_enter_dependencies(obj: MultihostRole | MultihostHost, where: str) -> None:
@@ -1223,8 +1374,10 @@ def mh_utility_exit_dependencies(obj: MultihostRole | MultihostHost, where: str)
         except Exception as e:
             errors.append(e)
 
+        util._op_state.clear(f"__enter__{where}")
+
     if errors:
-        raise Exception(errors)
+        raise TeardownExceptionGroup("Unable to exit some utilities (util.__exit__)", errors)
 
 
 def mh_utility_pytest_report_teststatus(

@@ -1,15 +1,96 @@
 from __future__ import annotations
 
+import signal
+from collections.abc import Mapping
 from copy import deepcopy
-from functools import partial
+from functools import partial, wraps
 from inspect import getfullargspec
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
 
 from .types import MultihostOutcome
 
 if TYPE_CHECKING:
     from .artifacts import MultihostArtifactsMode
+
+
+Param = ParamSpec("Param")
+RetType = TypeVar("RetType")
+
+
+def timeout(
+    seconds: int, message: str = "Operation timed out"
+) -> Callable[[Callable[Param, RetType]], Callable[Param, RetType]]:
+    """
+    Raise TimeoutError if function takes longer then ``seconds`` to finish.
+
+    :param seconds: Number of seconds to wait.
+    :type seconds: int
+    :param message: Exception message, defaults to "Operation timed out"
+    :type message: str, optional
+    :raises ValueError: If ``seconds`` is less or equal to zero.
+    :raises TimeoutError: If timeout occurrs.
+    :return: Decorator.
+    :rtype: Callable[[Callable[Param, RetType]], Callable[Param, RetType]]
+    """
+    if seconds < 0:
+        raise ValueError(f"Invalid timeout value: {seconds}")
+
+    def _timeout_handler(signum, frame):
+        raise TimeoutError(seconds, message)
+
+    def decorator(func: Callable[Param, RetType]) -> Callable[Param, RetType]:
+        if seconds == 0:
+            return func
+
+        @wraps(func)
+        def wrapper(*args: Param.args, **kwargs: Param.kwargs) -> RetType:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            old_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, *old_timer)
+                signal.signal(signal.SIGALRM, old_handler)
+
+        return wrapper
+
+    return decorator
+
+
+def validate_configuration(
+    required_keys: list[str], confdict: dict[str, Any], error_fmt: str = '"{key}" property is missing'
+) -> None:
+    """
+    Validate configuration dictionary.
+
+    Check that it contains all required keys. The key may contain ``.`` to check
+    nested keys, for example ``ssh.user``.
+
+    :param required_keys: Required keys.
+    :type required_keys: list[str]
+    :param confdict: Configuration dictionary.
+    :type confdict: dict[str, Any]
+    :param error_fmt: _description_, defaults to '"{key}" property is missing'
+    :type error_fmt: str, optional
+    :raises ValueError: If a required key is missing or empty.
+    :return: ``True`` if all keys are present and not empty, ``False`` otherwise.
+    :rtype: bool
+    """
+
+    def is_property_in_dict(property: str, d: dict[str, Any]) -> bool:
+        if "." in property:
+            key, subpath = property.split(".", maxsplit=1)
+            if not d.get(key, None):
+                return False
+
+            return is_property_in_dict(subpath, d[key])
+
+        return isinstance(d, Mapping) and property in d and d[property]
+
+    for key in required_keys:
+        if not is_property_in_dict(key, confdict):
+            raise ValueError(error_fmt.format(key=key))
 
 
 def merge_dict(*args: dict | None):

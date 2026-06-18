@@ -6,7 +6,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, get_args
 
-from ..ssh import SSHLog
+from ..conn import ProcessLogLevel
+from .errors import ArtifactsExceptionGroup
 from .misc import sanitize_path, should_collect_artifacts
 from .types import MultihostOSFamily, MultihostOutcome
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from .multihost import MultihostHost
 
 
+# +DOCS/MultihostArtifactsType
 MultihostArtifactsType: TypeAlias = Literal[
     "pytest_setup", "pytest_teardown", "topology_setup", "topology_teardown", "test"
 ]
@@ -27,6 +29,7 @@ Multihost artifacts type.
 * ``topology_teardown``: collected after :meth:`TopologyController.topology_teardown`
 * ``test``: collected after each test run
 """
+# -DOCS/MultihostArtifactsType
 
 
 MultihostArtifactsMode: TypeAlias = Literal["never", "on-failure", "always"]
@@ -148,7 +151,7 @@ class MultihostArtifactsCollectable(Protocol):
     Protocol: object supports artifacts collection.
     """
 
-    def get_artifacts_list(self, host: MultihostHost, type: MultihostArtifactsType) -> set[str]:
+    def get_artifacts_list(self, host: MultihostHost, artifacts_type: MultihostArtifactsType) -> set[str]:
         """
         Return the list of artifacts to collect.
 
@@ -159,8 +162,8 @@ class MultihostArtifactsCollectable(Protocol):
 
         :param host: Host where the artifacts are being collected.
         :type host: MultihostHost
-        :param type: Type of artifacts that are being collected.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Type of artifacts that are being collected.
+        :type artifacts_type: MultihostArtifactsType
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
@@ -211,7 +214,7 @@ class MultihostArtifactsCollector(object):
 
     def collect(
         self,
-        type: MultihostArtifactsType,
+        artifacts_type: MultihostArtifactsType,
         *,
         path: str,
         outcome: MultihostOutcome,
@@ -220,8 +223,8 @@ class MultihostArtifactsCollector(object):
         """
         Collect artifacts to $artifacts_dir/$path/$collection_path.
 
-        :param type: Artifacts type.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Artifacts type.
+        :type artifacts_type: MultihostArtifactsType
         :param path: Artifacts path relative to artifacts directory.
         :type path: str
         :param outcome: Test or operation outcome.
@@ -244,12 +247,12 @@ class MultihostArtifactsCollector(object):
         artifacts_set: set[str] = set()
         for obj in collect_objects:
             try:
-                artifacts_set.update(obj.get_artifacts_list(self.host, type))
+                artifacts_set.update(obj.get_artifacts_list(self.host, artifacts_type))
             except Exception as e:
                 errors.append(e)
 
         if errors:
-            raise Exception(errors)
+            raise ArtifactsExceptionGroup("Unable to collect artifacts from all hosts", errors)
 
         # Sort artifacts by name
         artifacts = sorted(artifacts_set)
@@ -285,7 +288,7 @@ class MultihostArtifactsCollector(object):
             case _:
                 raise ValueError(f"Unknown operating system: {self.host.os_family}")
 
-        result = self.host.ssh.run(command, log_level=SSHLog.Error)
+        result = self.host.conn.run(command, log_level=ProcessLogLevel.Error)
 
         # Return if no artifacts were obtained
         if not result.stdout:

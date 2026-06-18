@@ -8,6 +8,7 @@ import pytest
 
 from .artifacts import MultihostArtifactsCollectable
 from .data import MultihostItemData
+from .errors import SkipCallbackExceptionGroup, TeardownExceptionGroup
 from .logging import MultihostLogger
 from .marks import TopologyMark
 from .misc import invoke_callback
@@ -184,15 +185,39 @@ class MultihostFixture(object):
     def _skip(self) -> bool:
         self._skipped = False
 
-        reason = self._skip_by_topology(self.topology_controller)
-        if reason is not None:
-            self._skipped = True
-            pytest.skip(reason)
+        try:
+            try:
+                self.log_phase("SKIP BY TOPOLOGY")
+                reason = self._skip_by_topology(self.topology_controller)
+                if reason is not None:
+                    self._skipped = True
+                    pytest.skip(reason)
+            finally:
+                self.log_phase("SKIP BY TOPOLOGY DONE")
 
-        reason = self._skip_by_require_marker(self.topology_mark, self.request.node)
-        if reason is not None:
+            try:
+                self.log_phase("SKIP BY REQUIRE MARKER")
+                reason = self._skip_by_require_marker(self.topology_mark, self.request.node)
+                if reason is not None:
+                    self._skipped = True
+                    pytest.skip(reason)
+            finally:
+                self.log_phase("SKIP BY REQUIRE MARKER DONE")
+        except Exception as e:
+            # Just re-raise if pytest.skip was called, unfortunately pytest.skip
+            # raises exception that is not publicly available, so we have to
+            # rely on our attribute.
+            if self._skipped:
+                raise
+
+            # Error out and skip the test
+            self.data.outcome = "error"
             self._skipped = True
-            pytest.skip(reason)
+            raise SkipCallbackExceptionGroup("An exception occurred inside a skip callback", [e])
+        finally:
+            self.split_log_file("skip.log")
+            if self.data.outcome == "error":
+                self.logger.flush(self.data.outcome)
 
         return self._skipped
 
@@ -284,7 +309,7 @@ class MultihostFixture(object):
                     errors.append(e)
 
         if errors:
-            raise Exception(errors)
+            raise TeardownExceptionGroup("Unable to teardown some roles (role.teardown)", errors)
 
     def _teardown_utils(self) -> None:
         """
@@ -313,7 +338,7 @@ class MultihostFixture(object):
                     errors.append(e)
 
         if errors:
-            raise Exception(errors)
+            raise TeardownExceptionGroup("Unable to teardown some hosts (host.teardown)", errors)
 
     def _teardown_hosts_utils(self) -> None:
         """
@@ -327,7 +352,7 @@ class MultihostFixture(object):
                 errors.append(e)
 
         if errors:
-            raise Exception(errors)
+            raise TeardownExceptionGroup("Unable to exit some utilities (util.__exit__)", errors)
 
     def _pytest_report_teststatus(
         self, report: pytest.CollectReport | pytest.TestReport, config: pytest.Config
@@ -338,6 +363,8 @@ class MultihostFixture(object):
         for item in self.roles + self.hosts:
             result = mh_utility_pytest_report_teststatus(item, report, config)
             if result is not None:
+                # Change stored outcome since the hook may have changed it.
+                self.data.outcome = report.outcome
                 return result
 
         return None
@@ -434,9 +461,9 @@ class MultihostFixture(object):
         self.split_log_file("teardown.log")
         self.logger.flush(self.data.outcome)
 
-        errors = [x for x in errors if x is not None]
-        if errors:
-            raise Exception(errors)
+        all_errors = [x for x in errors if x is not None]
+        if all_errors:
+            raise TeardownExceptionGroup("One or more error occurred during test teardown", all_errors)
 
 
 @pytest.fixture(scope="function")
@@ -491,3 +518,70 @@ def mh(request: pytest.FixtureRequest) -> Generator[MultihostFixture, None, None
             mh.split_log_file("test.log")
 
         mh._exit()
+
+
+@pytest.fixture(scope="function")
+def mh_config(mh: MultihostFixture) -> MultihostConfig:
+    """
+    Multihost configuration.
+
+    :param mh: mh fixture
+    :type mh: MultihostFixture
+    :return: Multihost configuration
+    :rtype: MultihostConfig
+    """
+    return mh.multihost
+
+
+@pytest.fixture(scope="function")
+def mh_logger(mh: MultihostFixture) -> MultihostLogger:
+    """
+    Multihost logger.
+
+    Can be used to log messages into the test log.
+
+    :param mh: mh fixture
+    :type mh: MultihostFixture
+    :return: Multihost logger.
+    :rtype: MultihostLogger
+    """
+    return mh.logger
+
+
+@pytest.fixture(scope="function")
+def mh_topology(mh: MultihostFixture) -> Topology:
+    """
+    Current topology.
+
+    :param mh: mh fixture
+    :type mh: MultihostFixture
+    :return: Current topology
+    :rtype: Topology
+    """
+    return mh.topology
+
+
+@pytest.fixture(scope="function")
+def mh_topology_name(mh: MultihostFixture) -> str:
+    """
+    Current topology name.
+
+    :param mh: mh fixture
+    :type mh: MultihostFixture
+    :return: Current topology name
+    :rtype: str
+    """
+    return mh.topology_mark.name
+
+
+@pytest.fixture(scope="function")
+def mh_topology_mark(mh: MultihostFixture) -> TopologyMark:
+    """
+    Current topology mark.
+
+    :param mh: mh fixture
+    :type mh: MultihostFixture
+    :return: Current topology mark
+    :rtype: TopologyMark
+    """
+    return mh.topology_mark

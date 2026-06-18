@@ -5,12 +5,12 @@ from typing import Any
 from pytest_mh.cli import CLIBuilder, CLIBuilderArgs
 
 from .. import MultihostArtifactsType, MultihostHost, MultihostUtility
-from ..ssh import SSHLog, SSHProcessResult
+from ..conn import ProcessLogLevel, ProcessResult
 
 __all__ = ["JournaldUtils"]
 
 
-class JournaldUtils(MultihostUtility):
+class JournaldUtils(MultihostUtility[MultihostHost]):
     """
     Perform journald related tasks.
     """
@@ -31,26 +31,27 @@ class JournaldUtils(MultihostUtility):
         :return: Current date and time that can be used to filter the journal.
         :rtype: str
         """
-        return self.host.ssh.exec(["date", "+%Y-%m-%d %H:%M:%S.%N"], log_level=SSHLog.Error).stdout.strip()
+        return self.host.conn.exec(["date", "+%Y-%m-%d %H:%M:%S.%N"], log_level=ProcessLogLevel.Error).stdout.strip()
 
     def setup(self) -> None:
         """
         Called before execution of each test.
         """
         self._test_start = self.now
+        self._cursor = self._test_start
 
-    def get_artifacts_list(self, host: MultihostHost, type: MultihostArtifactsType) -> set[str]:
+    def get_artifacts_list(self, host: MultihostHost, artifacts_type: MultihostArtifactsType) -> set[str]:
         """
         Dump journald into file that can be collected.
 
         :param host: Host where the artifacts are being collected.
         :type host: MultihostHost
-        :param type: Type of artifacts that are being collected.
-        :type type: MultihostArtifactsType
+        :param artifacts_type: Type of artifacts that are being collected.
+        :type artifacts_type: MultihostArtifactsType
         :return: List of artifacts to collect.
         :rtype: set[str]
         """
-        self.host.ssh.run(f"journalctl --since '{self._test_start}' > /var/log/journald.log")
+        self.host.conn.run(f"journalctl --since '{self._test_start}' > /var/log/journald.log")
         return {"/var/log/journald.log"}
 
     def clear(self) -> None:
@@ -67,14 +68,13 @@ class JournaldUtils(MultihostUtility):
         lines: int | None = None,
         since: str | None = None,
         reverse: bool = False,
-        no_pager: bool = False,
         grep: str | None = None,
         output: str | None = None,
         identifier: str | None = None,
         system: bool = False,
         user: bool = False,
         args: list[Any] | None = None,
-    ) -> SSHProcessResult:
+    ) -> ProcessResult:
         """
         Execute journalctl with given arguments. Show messages only for current test run, by default.
         Note that raise_on_error is False and the command may return non-zero return code.
@@ -89,8 +89,6 @@ class JournaldUtils(MultihostUtility):
         :type since: str | None, optional
         :param reverse: Reverse output so that the newest entries are displayed first, defaults to False
         :type reverse: bool, optional
-        :param no_pager: Do not pipe output into a pager, defaults to False
-        :type no_pager: bool, optional
         :param grep: Filter output to entries where the MESSAGE= field matches specified regex, defaults to None
         :type grep: str | None, optional
         :param output: Controls the formatting of the journal entries, defaults to None
@@ -104,9 +102,9 @@ class JournaldUtils(MultihostUtility):
         :param args: Additional options, defaults to None
         :type args: list[Any] | None, optional
         :return: SSH process result
-        :rtype: SSHProcessResult
+        :rtype: ProcessResult
         """
-        cli: CLIBuilder = CLIBuilder(self.host.ssh)
+        cli: CLIBuilder = self.host.cli
         if current:
             since = since if since else self._cursor
 
@@ -116,35 +114,39 @@ class JournaldUtils(MultihostUtility):
             "lines": (cli.option.VALUE, lines),
             "since": (cli.option.VALUE, since),
             "reverse": (cli.option.SWITCH, reverse),
-            "no-pager": (cli.option.SWITCH, no_pager),
             "grep": (cli.option.VALUE, grep),
             "output": (cli.option.VALUE, output),
             "identifier": (cli.option.VALUE, identifier),
             "system": (cli.option.SWITCH, system),
             "user": (cli.option.SWITCH, user),
+            "no-pager": (cli.option.SWITCH, True),
         }
 
-        return self.host.ssh.exec(["journalctl"] + cli.args(builder) + args, raise_on_error=False)
+        return self.host.conn.exec(["journalctl"] + cli.args(builder) + args, raise_on_error=False)
 
-    def is_match(self, pattern: str) -> bool:
+    def is_match(self, pattern: str, unit: str | None = None) -> bool:
         """
         Search the logs for a pattern.
 
         :param pattern: Pattern to be searched for
         :type pattern: str
+        :param unit: Search only messages for given systemd unit, defaults to None
+        :type unit: str | None, optional
         :return: True, if pattern found
         :rtype: bool
         """
-        return self.journalctl(grep=pattern).rc == 0
+        return self.journalctl(grep=pattern, unit=unit).rc == 0
 
-    def count(self, pattern: str) -> int:
+    def count(self, pattern: str, unit: str | None = None) -> int:
         """
         Search the logs for a pattern and return number of occurrences.
 
         :param pattern: Pattern to be searched for
         :type pattern: str
+        :param unit: Search only messages for given systemd unit, defaults to None
+        :type unit: str | None, optional
         :return: Number of occurrences of the pattern
         :rtype: int
         """
-        process = self.journalctl(grep=pattern)
+        process = self.journalctl(grep=pattern, unit=unit)
         return len(process.stdout_lines) if process.rc == 0 else 0

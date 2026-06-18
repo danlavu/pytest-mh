@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from .. import MultihostHost, MultihostUtility
-from ..ssh import SSHLog
+from .. import MultihostHost, MultihostRole, MultihostUtility
+from ..conn import ProcessLogLevel
 
 __all__ = ["LinuxTrafficControl"]
 
 
-class LinuxTrafficControl(MultihostUtility):
+class LinuxTrafficControl(MultihostUtility[MultihostHost]):
     """
     Perform traffic control operations on remote host.
 
@@ -33,7 +33,7 @@ class LinuxTrafficControl(MultihostUtility):
         super().setup()
 
         # Let's find out the available interfaces
-        result = self.host.ssh.run("ip -o address", log_level=SSHLog.Error)
+        result = self.host.conn.run("ip -o address", log_level=ProcessLogLevel.Error)
         split_result = result.stdout.splitlines()
 
         for line in split_result:
@@ -48,7 +48,7 @@ class LinuxTrafficControl(MultihostUtility):
             )
             self.__restore_root.add(f"tc qdisc del dev {interface} root")
 
-        self.host.ssh.run(commands, log_level=SSHLog.Error)
+        self.host.conn.run(commands, log_level=ProcessLogLevel.Error)
 
     def teardown(self) -> None:
         """
@@ -59,19 +59,33 @@ class LinuxTrafficControl(MultihostUtility):
         tear: str = ""
         for iter in self.__restore_root:
             tear += iter + "\n"
-        self.host.ssh.run(tear, log_level=SSHLog.Error)
+        self.host.conn.run(tear, log_level=ProcessLogLevel.Error)
         super().teardown()
 
-    def add_delay(self, hostname: str, time: str | int):
+    def _get_hostname(self, host: str | MultihostHost | MultihostRole) -> str:
+        if isinstance(host, str):
+            return host
+
+        if isinstance(host, MultihostHost):
+            return host.hostname
+
+        if isinstance(host, MultihostRole):
+            return host.host.hostname
+
+        raise ValueError(f"Invalid type of host: {type(host)}, expeted str | MultihostHost | MultihostRole")
+
+    def add_delay(self, host: str | MultihostHost | MultihostRole, time: str | int):
         """
         Add delay to the network connection. A maximum of 15 connections can be delayed at a time. It is recommended
         to specify the delay from minimum to maximum to avoid starvation.
 
-        :param hostname: Target hostname.
-        :type hostname: str
+        :param host: Target hostname or multihost host or role.
+        :type host: str | MultihostHost | MultihostRole
         :param time: Delay. Units can be specified; if not specified, the default is milliseconds.
         :type time: str | int
         """
+        hostname = self._get_hostname(host)
+
         if isinstance(time, int):
             time_unit = f"{time}ms"
         else:
@@ -79,7 +93,7 @@ class LinuxTrafficControl(MultihostUtility):
 
         self.logger.info(f"Adding network delay {time_unit} to {hostname}")
 
-        ips = self.host.ssh.run(f"dig +short {hostname}", log_level=SSHLog.Error)
+        ips = self.host.conn.run(f"dig +short {hostname}", log_level=ProcessLogLevel.Error)
         ip_list = ips.stdout.splitlines()
 
         commands = "set -e\n"
@@ -95,19 +109,21 @@ class LinuxTrafficControl(MultihostUtility):
                 )
                 self.__restore_filters[ip] = self.__band
 
-        self.host.ssh.run(commands, log_level=SSHLog.Error)
+        self.host.conn.run(commands, log_level=ProcessLogLevel.Error)
         self.__band += 1
 
-    def remove_delay(self, hostname: str):
+    def remove_delay(self, host: str | MultihostHost | MultihostRole):
         """
         Remove delay in the network connection.
 
-        :param hostname: Target hostname.
-        :type hostname: str
+        :param host: Target hostname or multihost host or role.
+        :type host: str | MultihostHost | MultihostRole
         """
+        hostname = self._get_hostname(host)
+
         self.logger.info(f"Removing network delay to {hostname}")
 
-        ips = self.host.ssh.run(f"dig +short {hostname}", log_level=SSHLog.Error)
+        ips = self.host.conn.run(f"dig +short {hostname}", log_level=ProcessLogLevel.Error)
         ip_list = ips.stdout.splitlines()
 
         bands: set[int] = set()
@@ -122,4 +138,4 @@ class LinuxTrafficControl(MultihostUtility):
 
             commands += f"tc qdisc del dev {interface} parent 1:{band} handle {band * 10}: netem\n"
 
-        self.host.ssh.run(commands, log_level=SSHLog.Error)
+        self.host.conn.run(commands, log_level=ProcessLogLevel.Error)
